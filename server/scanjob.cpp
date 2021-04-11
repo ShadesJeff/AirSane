@@ -53,6 +53,11 @@ struct ScanSettingsXml
     : xml(s)
   {}
 
+  size_t find(const std::string& str) const
+  {
+    return xml.find(str, 0);
+  }
+
   std::string getString(const std::string& name) const
   { // scan settings xml is simple enough to avoid using a parser
     std::regex r("<([a-zA-Z]+:" + name + ")>([^<]*)</\\1>");
@@ -68,7 +73,9 @@ struct ScanSettingsXml
   {
     return sanecpp::strtod_c(getString(name));
   }
+
   std::string xml;
+
 };
 
 }
@@ -113,7 +120,7 @@ struct ScanJob::Private
 
   std::string mScanSource, mIntent, mDocumentFormat, mColorMode;
   int mBitDepth, mRes_dpi;
-  bool mColorScan, mSynthesizedGray, mRotateEvenPages;
+  bool mColorScan, mSynthesizedGray, mRotateEvenPages, mUseEdgeDetection;
   double mLeft_px, mTop_px, mWidth_px, mHeight_px;
 
   int mKind, mImagesToTransfer, mImagesCompleted, mImagesTransferred;
@@ -234,6 +241,10 @@ ScanJob::Private::init(const ScanSettingsXml& settings, bool autoselectFormat, c
   mRes_dpi = res_dpi;
 
   mBitDepth = 0;
+
+  mUseEdgeDetection = false;
+  if (settings.find("pwg:MustHonor=\"false\"") > 0)
+    mUseEdgeDetection = true;
 
   std::string esclColorMode = settings.getString("ColorMode");
   std::smatch m;
@@ -668,7 +679,10 @@ ScanJob::Private::openSession()
     opt[SANE_NAME_BIT_DEPTH] = mBitDepth;
     opt[SANE_NAME_SCAN_MODE] = mColorMode;
     opt[SANE_NAME_SCAN_SOURCE] = mScanSource;
-    // opt[MORE_SANE_NAME_ALD] = SANE_TRUE;
+
+    if (mUseEdgeDetection)
+      opt[MORE_SANE_NAME_ALD] = SANE_TRUE;
+    
     bool ok = opt[SANE_NAME_SCAN_RESOLUTION].set_numeric_value(mRes_dpi);
     if (!ok)
       ok = opt[SANE_NAME_SCAN_X_RESOLUTION].set_numeric_value(mRes_dpi) ||
@@ -693,8 +707,11 @@ ScanJob::Private::openSession()
     opt[SANE_NAME_SCAN_TL_Y] = top;
     opt[SANE_NAME_SCAN_BR_X] = right;
     opt[SANE_NAME_SCAN_BR_Y] = bottom;
-    // opt[SANE_NAME_SCAN_BR_Y] = 876.0;
-    // opt[SANE_NAME_PAGE_HEIGHT] = 876.0;
+    
+    if (mUseEdgeDetection) {
+      opt[SANE_NAME_SCAN_BR_Y] = 876.0;
+      opt[SANE_NAME_PAGE_HEIGHT] = 876.0;
+    }
 
     if (!ok)
       status = SANE_STATUS_INVAL;
