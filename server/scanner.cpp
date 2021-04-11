@@ -272,9 +272,9 @@ Scanner::Private::writeScannerCapabilitiesXml(std::ostream& os) const
   if (!mIconUrl.empty())
     os << "<scan:IconURI>" << mIconUrl << "</scan:IconURI>\r\n";
 
-  // // write settings profile
+  // // write shared settings profile to be used across capabilities
   // os << "<scan:SettingProfiles>\r\n";
-  // writeSettingProfile(8, os); // should be mMaxBits
+  // writeSettingProfile(8, os); // should be mMaxBits, but access rules apply
   // os << "</scan:SettingProfiles>\r\n";
 
   if (mpPlaten) {
@@ -282,37 +282,31 @@ Scanner::Private::writeScannerCapabilitiesXml(std::ostream& os) const
     mpPlaten->writeCapabilitiesXml(os, 1);
     os << "</scan:PlatenInputCaps>\r\n</scan:Platen>\r\n";
   }
-  if (mpAdf && !mDuplex) {
-    os << "<scan:Adf>\r\n<scan:AdfSimplexInputCaps>\r\n";
-    mpAdf->writeCapabilitiesXml(os, 1);
-    os << "</scan:AdfSimplexInputCaps>\r\n"
-       << "<scan:AdfOptions>\r\n"
-       << "<scan:AdfOption>DetectPaperLoaded</scan:AdfOption>\r\n"
-       << "</scan:AdfOptions>\r\n"
-       << "</scan:Adf>\r\n";
-  }
-  if (mpAdf && mDuplex) {
-
+  if (mpAdf) {
+    
     os << "<scan:Adf>\r\n<scan:AdfSimplexInputCaps>\r\n";
     mpAdf->writeCapabilitiesXml(os, 1);
     os << "</scan:AdfSimplexInputCaps>\r\n";
-       //<< "<scan:AdfOptions>\r\n"
-       //<< "<scan:AdfOption>DetectPaperLoaded</scan:AdfOption>\r\n"
-       //<< "</scan:AdfOptions>\r\n";
-       //<< "</scan:Adf>\r\n";
+
+    if (mDuplex) {
+      os << "<scan:AdfDuplexInputCaps>\r\n";
+      mpAdf->writeCapabilitiesXml(os, 2);
+      os << "</scan:AdfDuplexInputCaps>\r\n";
+    }
+
+    os << "<scan:AdfOptions>\r\n";
     
-    //os << "<scan:Adf>\r\n<scan:AdfDuplexInputCaps>\r\n";
-    os << "<scan:AdfDuplexInputCaps>\r\n";
-    mpAdf->writeCapabilitiesXml(os, 2);
-    os << "</scan:AdfDuplexInputCaps>\r\n"
-       << "<scan:AdfOptions>\r\n";
     if (mDuplex)
        os << "<scan:AdfOption>Duplex</scan:AdfOption>\r\n";
+
+       // TODO: Confirm this with sane scanner capabilities
     os << "<scan:AdfOption>DetectPaperLoaded</scan:AdfOption>\r\n"
+       // TODO: Confirm this with sane scanner capabilities
        << "<scan:AdfOption>SelectSinglePage</scan:AdfOption>\r\n"
        << "</scan:AdfOptions>\r\n";
 
-    os << "<scan:FeederCapacity>50</scan:FeederCapacity>\r\n";    
+    // TODO: Where to get this number?
+    os << "<scan:FeederCapacity>50</scan:FeederCapacity>\r\n";
     
     os << "</scan:Adf>\r\n";
   }
@@ -465,6 +459,8 @@ Scanner::Private::InputSource::writeCapabilitiesXml(std::ostream& os, int maxSca
         << "<scan:SupportedEdge>BottomEdge</scan:SupportedEdge>\r\n"
         << "</scan:EdgeAutoDetection>\r\n";
 
+  // This seems to be ignored by clients and is really more to instruct
+  // the scanner/driver what the client wants from an outcome perspective
   // os << "<scan:SupportedIntents>\r\n";
   // for (const auto& s : mSupportedIntents)
   //   os << "<scan:SupportedIntent>" << s << "</scan:SupportedIntent>\r\n";
@@ -530,6 +526,7 @@ Scanner::Private::init(const sanecpp::device_info& info, bool randomUuid)
     HttpServer::MIME_TYPE_PDF,
     HttpServer::MIME_TYPE_JPEG,
     HttpServer::MIME_TYPE_PNG,
+    // TODO: For pure black-and-white mode
     // "application/octet-stream",
   });
 

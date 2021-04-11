@@ -53,7 +53,6 @@ public:
   bool beginTransfer();
   bool resumeTransfer();
   ScanJob& finishTransfer(std::ostream&);
-  // ScanJob& transferBackside(std::ostream&);
   ScanJob& cancel();
 
   typedef enum
