@@ -1,6 +1,8 @@
-![build](https://github.com/SimulPiscator/AirSane/workflows/build/badge.svg)
-
 # AirSane
+
+This is a forked version of @SimulPiscator's AirSane that adds rudimentary
+duplex and automatic page length detection that works with the ScanSnap ix500
+(and possibly other?) scanners.
 
 A SANE WebScan frontend that supports Apple's AirScan protocol.
 Scanners are detected automatically, and published through mDNS.
