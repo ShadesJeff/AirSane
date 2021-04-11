@@ -27,6 +27,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <cmath>
 #include <regex>
 #include <sane/saneopts.h>
+#include "more_saneopts.h"
 
 // pwg JobStateReasonsWKV
 static const char* PWG_NONE = "None";
@@ -52,6 +53,11 @@ struct ScanSettingsXml
     : xml(s)
   {}
 
+  size_t find(const std::string& str) const
+  {
+    return xml.find(str, 0);
+  }
+
   std::string getString(const std::string& name) const
   { // scan settings xml is simple enough to avoid using a parser
     std::regex r("<([a-zA-Z]+:" + name + ")>([^<]*)</\\1>");
@@ -67,7 +73,9 @@ struct ScanSettingsXml
   {
     return sanecpp::strtod_c(getString(name));
   }
+
   std::string xml;
+
 };
 
 }
@@ -88,12 +96,16 @@ struct ScanJob::Private
   void closeSession();
 
   bool beginTransfer();
+  bool resumeTransfer();
   void finishTransfer(std::ostream&);
 
   bool isPending() const;
   bool isProcessing() const;
   bool isFinished() const;
   bool isAborted() const;
+
+  int numCompletedSides() const;
+  bool isSecondSidePending() const;
 
   Scanner* mpScanner;
 
@@ -103,16 +115,21 @@ struct ScanJob::Private
   std::atomic<const char*> mStateReason;
   SANE_Status mAdfStatus;
 
+  int mNumCompletedSides;
+
   std::string mScanSource, mIntent, mDocumentFormat, mColorMode;
   int mBitDepth, mRes_dpi;
-  bool mColorScan, mSynthesizedGray, mRotateEvenPages;
+  bool mColorScan, mSynthesizedGray, mRotateEvenPages, mUseEdgeDetection;
   double mLeft_px, mTop_px, mWidth_px, mHeight_px;
 
-  int mKind, mImagesToTransfer, mImagesCompleted;
+  int mKind, mImagesToTransfer, mImagesCompleted, mImagesTransferred;
   std::shared_ptr<sanecpp::session> mpSession;
 
   OptionsFile::Options mDeviceOptions;
   std::vector<uint16_t> mGammaTable;
+
+  std::vector<std::vector<char>> backside_buffer;
+
 };
 
 ScanJob::ScanJob(Scanner* scanner, const std::string& uuid)
@@ -154,6 +171,12 @@ int
 ScanJob::imagesCompleted() const
 {
   return p->mImagesCompleted;
+}
+
+int
+ScanJob::imagesTransferred() const
+{
+  return p->mImagesTransferred;
 }
 
 std::string
@@ -218,6 +241,10 @@ ScanJob::Private::init(const ScanSettingsXml& settings, bool autoselectFormat, c
 
   mBitDepth = 0;
 
+  mUseEdgeDetection = false;
+  if (settings.find("pwg:MustHonor=\"false\"") > 0)
+    mUseEdgeDetection = true;
+
   std::string esclColorMode = settings.getString("ColorMode");
   std::smatch m;
   if (std::regex_match(esclColorMode, m, std::regex("([A-Za-z]+)([0-9]+)"))) {
@@ -239,7 +266,9 @@ ScanJob::Private::init(const ScanSettingsXml& settings, bool autoselectFormat, c
 
   mIntent = settings.getString("Intent");
 
-  mDocumentFormat = settings.getString("DocumentFormat");
+  mDocumentFormat = settings.getString("DocumentFormatExt");
+  if (mDocumentFormat == "")
+    mDocumentFormat = settings.getString("DocumentFormat");
   std::clog << "document format requested: " << mDocumentFormat << "\n";
   if (autoselectFormat)
     mDocumentFormat = HttpServer::MIME_TYPE_PNG;
@@ -247,21 +276,38 @@ ScanJob::Private::init(const ScanSettingsXml& settings, bool autoselectFormat, c
 
   mImagesToTransfer = 1;
   mImagesCompleted = 0;
+  mImagesTransferred = 0;
+
+  mNumCompletedSides = 0;
 
   std::string inputSource = settings.getString("InputSource");
   if (inputSource == "Platen") {
     mScanSource = mpScanner->platenSourceName();
     mImagesToTransfer = 1;
-    mKind = single;
+    mKind = singleSimplex;
   }
   else if (inputSource == "Feeder") {
     mScanSource = mpScanner->adfSourceName();
-    mImagesToTransfer = std::numeric_limits<int>::max();
+
+    std::string duplex = settings.getString("Duplex");
+    if (duplex == "true")
+      mScanSource = mpScanner->adfDuplexSourceName();  
+
     double batchIfPossible = settings.getNumber("BatchIfPossible");
-    if (batchIfPossible == 1.0 && mDocumentFormat == HttpServer::MIME_TYPE_PDF)
-      mKind = adfBatch;
-    else
-      mKind = adfSingle;
+    
+    if (duplex == "false" && batchIfPossible != 1.0) {
+      mKind = singleSimplex;
+      mImagesToTransfer = 1;
+    } else if (duplex == "true" && batchIfPossible != 1.0) {
+      mKind = singleDuplex;
+      mImagesToTransfer = 2;
+    } else if (duplex == "false" && batchIfPossible == 1.0) {
+      mKind = multiSimplex;
+      mImagesToTransfer = std::numeric_limits<int>::max();
+    } else if (duplex == "true" && batchIfPossible == 1.0) {
+      mKind = multiDuplex;
+      mImagesToTransfer = std::numeric_limits<int>::max();
+    }
   }
   else {
     err = PWG_INVALID_SCAN_TICKET;
@@ -284,12 +330,14 @@ const char*
 ScanJob::Private::kindString() const
 {
   switch (mKind) {
-    case single:
-      return "single";
-    case adfBatch:
-      return "ADF batch";
-    case adfSingle:
-      return "ADF single";
+    case singleSimplex:
+      return "single simplex";
+    case singleDuplex:
+      return "single duplex";
+    case multiSimplex:
+      return "ADF multiple simplex";
+    case multiDuplex:
+      return "ADF multiple duplex";
   }
   return "unknown";
 }
@@ -466,32 +514,25 @@ ScanJob::Private::updateStatus(SANE_Status status)
       break;
     case SANE_STATUS_EOF:
       switch(mKind) {
-      case single:
-          if (mImagesCompleted > 0) {
-              mState = completed;
-              mStateReason = PWG_JOB_COMPLETED_SUCCESSFULLY;
+        case singleSimplex:
+        case multiSimplex:
+          mState = completed;
+          mStateReason = PWG_JOB_COMPLETED_SUCCESSFULLY;
+          break;
+        case singleDuplex:
+        case multiDuplex:
+          if (mNumCompletedSides == 2) {
+            mState = completed;
+            mStateReason = PWG_JOB_COMPLETED_SUCCESSFULLY;  
           } else {
-            mState = pending;
-            mStateReason = PWG_NONE;
+              mState = pending;
+              mStateReason = PWG_NONE;            
           }
-          break;
-      case adfSingle:
-          mState = pending;
-          mStateReason = PWG_NONE;
-          break;
-      case adfBatch:
-          updateStatus(mpSession->start().status());
-          break;
       }
       break;
     case SANE_STATUS_NO_DOCS:
-      if (mImagesCompleted > 0 && (mKind == adfSingle || mKind == adfBatch)) {
-        mState = completed;
-        mStateReason = PWG_JOB_COMPLETED_SUCCESSFULLY;
-      } else {
-        mState = aborted;
-        mStateReason = PWG_RESOURCES_ARE_NOT_READY;
-      }
+      mState = completed;
+      mStateReason = PWG_JOB_COMPLETED_SUCCESSFULLY;    
       mAdfStatus = status;
       break;
     default:
@@ -550,6 +591,30 @@ ScanJob::Private::beginTransfer()
   return ok;
 }
 
+bool
+ScanJob::resumeTransfer()
+{
+  return p->resumeTransfer();
+}
+
+bool
+ScanJob::Private::resumeTransfer()
+{
+  if(!atomicTransition(pending, processing))
+    return false;
+
+  // openSession();
+
+  SANE_Status status = SANE_STATUS_GOOD;
+  status = mpSession->start().status();
+  updateStatus(status);
+  
+  bool ok = isProcessing();
+  if (!ok)
+    closeSession();
+  return ok;
+}
+
 void
 ScanJob::Private::openSession()
 {
@@ -566,6 +631,10 @@ ScanJob::Private::openSession()
     opt[SANE_NAME_BIT_DEPTH] = mBitDepth;
     opt[SANE_NAME_SCAN_MODE] = mColorMode;
     opt[SANE_NAME_SCAN_SOURCE] = mScanSource;
+
+    if (mUseEdgeDetection)
+      opt[MORE_SANE_NAME_ALD] = SANE_TRUE;
+    
     bool ok = opt[SANE_NAME_SCAN_RESOLUTION].set_numeric_value(mRes_dpi);
     if (!ok)
       ok = opt[SANE_NAME_SCAN_X_RESOLUTION].set_numeric_value(mRes_dpi) ||
@@ -590,6 +659,12 @@ ScanJob::Private::openSession()
     opt[SANE_NAME_SCAN_TL_Y] = top;
     opt[SANE_NAME_SCAN_BR_X] = right;
     opt[SANE_NAME_SCAN_BR_Y] = bottom;
+    
+    // TODO: Read maximum length from sane rather than hardcoding...
+    if (mUseEdgeDetection) {
+      opt[SANE_NAME_SCAN_BR_Y] = 876.0;
+      opt[SANE_NAME_PAGE_HEIGHT] = 876.0;
+    }
 
     if (!ok)
       status = SANE_STATUS_INVAL;
@@ -619,6 +694,9 @@ void
 ScanJob::Private::finishTransfer(std::ostream& os)
 {
   std::shared_ptr<ImageEncoder> pEncoder;
+  std::vector<std::vector<char>> vvcPreBuffer(0);
+  SANE_Status status = SANE_STATUS_GOOD;  
+  bool isPreBuffered = false;
   if (isProcessing()) {
     if (mDocumentFormat == HttpServer::MIME_TYPE_JPEG) {
       auto jpegEncoder = new JpegEncoder;
@@ -652,6 +730,21 @@ ScanJob::Private::finishTransfer(std::ostream& os)
     auto p = mpSession->parameters();
     pEncoder->setWidth(p->pixels_per_line);
     pEncoder->setHeight(p->lines);
+    std::clog << "encoding height (lines): " << p->lines << std::endl;  
+    // Buffer if p->lines < 0
+    if (p->lines < 0) {
+      vvcPreBuffer.reserve(4000);
+      std::vector<char> buffer(mpSession->parameters()->bytes_per_line);
+      while (status == SANE_STATUS_GOOD && os && isProcessing()) {
+        status = mpSession->read(buffer).status();
+        if (status == SANE_STATUS_GOOD) {
+          vvcPreBuffer.push_back(buffer);
+        }
+      }
+      std::clog << "vvcPreBuffer size: " << vvcPreBuffer.size() << std::endl;
+      pEncoder->setHeight(vvcPreBuffer.size());
+      isPreBuffered = true;
+    }
     pEncoder->setBitDepth(p->depth);
     pEncoder->setDestination(&os);
     if (mSynthesizedGray && pEncoder->bytesPerLine() != p->bytes_per_line / 3) {
@@ -672,11 +765,31 @@ ScanJob::Private::finishTransfer(std::ostream& os)
     }
   }
   while (isProcessing()) {
-    std::vector<char> buffer(mpSession->parameters()->bytes_per_line);
-    SANE_Status status = SANE_STATUS_GOOD;
-    while (status == SANE_STATUS_GOOD && os && isProcessing()) {
-      status = mpSession->read(buffer).status();
-      if (status == SANE_STATUS_GOOD) {
+    if (!isPreBuffered) {
+      std::vector<char> buffer(mpSession->parameters()->bytes_per_line);
+      status = SANE_STATUS_GOOD;
+      while (status == SANE_STATUS_GOOD && os && isProcessing()) {
+        status = mpSession->read(buffer).status();
+        if (status == SANE_STATUS_GOOD) {
+          applyGamma(buffer);
+          if (mSynthesizedGray)
+            synthesizeGray(buffer);
+          try {
+            pEncoder->writeLine(buffer.data());
+            if (!os.flush())
+              throw std::runtime_error("Could not send data");
+          } catch (const std::runtime_error& e) {
+            std::cerr << e.what() << ", aborting" << std::endl;
+            mState = aborted;
+            mStateReason = PWG_ERRORS_DETECTED;
+          }
+        }
+      }
+    } else {
+      // Read from buffer
+      std::vector<char> buffer(mpSession->parameters()->bytes_per_line);
+      for (auto& it : vvcPreBuffer) {
+        buffer = it;
         applyGamma(buffer);
         if (mSynthesizedGray)
           synthesizeGray(buffer);
@@ -705,7 +818,17 @@ ScanJob::Private::finishTransfer(std::ostream& os)
     }
   }
   pEncoder->endDocument();
-  closeSession();
+  ++mImagesTransferred;
+  std::clog << "images transferred: " << mImagesTransferred << std::endl;
+  if (++mNumCompletedSides == 2 || mKind == singleSimplex || mKind == multiSimplex) {
+    closeSession();
+    mState = completed;
+    mStateReason = PWG_JOB_COMPLETED_SUCCESSFULLY;
+  }
+  else {
+    mState = pending;
+    mStateReason = PWG_NONE;
+  }
 }
 
 ScanJob&
@@ -759,6 +882,18 @@ ScanJob::isAborted() const
   return p->isAborted();
 }
 
+int
+ScanJob::numCompletedSides() const
+{
+  return p->numCompletedSides();
+}
+
+bool
+ScanJob::isSecondSidePending() const
+{
+  return p->isSecondSidePending();
+}
+
 bool
 ScanJob::Private::isPending() const
 {
@@ -790,4 +925,16 @@ bool
 ScanJob::Private::isAborted() const
 {
   return mState == aborted;
+}
+
+int
+ScanJob::Private::numCompletedSides() const
+{
+  return mNumCompletedSides;
+}
+
+bool
+ScanJob::Private::isSecondSidePending() const
+{
+  return ((mKind == singleDuplex || mKind == multiDuplex) && mNumCompletedSides == 1);
 }

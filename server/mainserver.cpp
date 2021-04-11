@@ -281,7 +281,7 @@ MainServer::buildMdnsService(const Scanner* pScanner)
   pService->setName(pScanner->publishedName());
   pService->setInterfaceIndex(interfaceIndex());
   pService->setTxt("txtvers", "1");
-  pService->setTxt("vers", "2.0");
+  pService->setTxt("vers", "2.6");
   std::string s;
   for (const auto& f : pScanner->documentFormats())
     s += "," + f;

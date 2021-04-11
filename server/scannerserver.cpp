@@ -131,6 +131,21 @@ ScannerServer::onRequest(const HttpServer::Request& request,
         if (job->isFinished()) {
           response.setStatus(HttpServer::HTTP_NOT_FOUND);
           response.send();
+        } else if (job->isSecondSidePending()) {
+            if (job->resumeTransfer()) {
+              response.setStatus(HttpServer::HTTP_OK);
+              response.setHeader(HttpServer::HTTP_HEADER_CONTENT_TYPE,
+                                job->documentFormat());
+              response.setHeader(HttpServer::HTTP_HEADER_TRANSFER_ENCODING,
+                                "chunked");
+              // job->transferBackside(response.send());
+              job->finishTransfer(response.send());
+            } else {
+              // TODO: Better error checking here...
+              response.setStatus(HttpServer::HTTP_NOT_FOUND);
+              response.send();
+            }
+        
         } else {
           if (job->beginTransfer()) {
             response.setStatus(HttpServer::HTTP_OK);

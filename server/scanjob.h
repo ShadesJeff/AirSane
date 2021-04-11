@@ -39,17 +39,19 @@ public:
                                    bool autoselectFormat,
                                    const OptionsFile::Options&);
 
-  enum { single, adfSingle, adfBatch };
+  enum { singleSimplex, singleDuplex, multiSimplex, multiDuplex };
   int kind() const;
 
   int ageSeconds() const;
   int imagesToTransfer() const;
   int imagesCompleted() const;
+  int imagesTransferred() const;
   std::string uri() const;
   const std::string& uuid() const;
   const std::string& documentFormat() const;
 
   bool beginTransfer();
+  bool resumeTransfer();
   ScanJob& finishTransfer(std::ostream&);
   ScanJob& cancel();
 
@@ -70,6 +72,9 @@ public:
   bool isProcessing() const;
   bool isFinished() const;
   bool isAborted() const;
+
+  int numCompletedSides() const;
+  bool isSecondSidePending() const;
 
   SANE_Status adfStatus() const;
 
