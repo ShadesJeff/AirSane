@@ -27,6 +27,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <cmath>
 #include <regex>
 #include <sane/saneopts.h>
+#include "more_saneopts.h"
 
 // pwg JobStateReasonsWKV
 static const char* PWG_NONE = "None";
@@ -88,12 +89,17 @@ struct ScanJob::Private
   void closeSession();
 
   bool beginTransfer();
+  bool resumeTransfer();
   void finishTransfer(std::ostream&);
+  // void transferBackside(std::ostream&);
 
   bool isPending() const;
   bool isProcessing() const;
   bool isFinished() const;
   bool isAborted() const;
+
+  int numCompletedSides() const;
+  bool isSecondSidePending() const;
 
   Scanner* mpScanner;
 
@@ -103,16 +109,21 @@ struct ScanJob::Private
   std::atomic<const char*> mStateReason;
   SANE_Status mAdfStatus;
 
+  int mNumCompletedSides;
+
   std::string mScanSource, mIntent, mDocumentFormat, mColorMode;
   int mBitDepth, mRes_dpi;
   bool mColorScan, mSynthesizedGray, mRotateEvenPages;
   double mLeft_px, mTop_px, mWidth_px, mHeight_px;
 
-  int mKind, mImagesToTransfer, mImagesCompleted;
+  int mKind, mImagesToTransfer, mImagesCompleted, mImagesTransferred;
   std::shared_ptr<sanecpp::session> mpSession;
 
   OptionsFile::Options mDeviceOptions;
   std::vector<uint16_t> mGammaTable;
+
+  std::vector<std::vector<char>> backside_buffer;
+
 };
 
 ScanJob::ScanJob(Scanner* scanner, const std::string& uuid)
@@ -154,6 +165,12 @@ int
 ScanJob::imagesCompleted() const
 {
   return p->mImagesCompleted;
+}
+
+int
+ScanJob::imagesTransferred() const
+{
+  return p->mImagesTransferred;
 }
 
 std::string
@@ -239,7 +256,9 @@ ScanJob::Private::init(const ScanSettingsXml& settings, bool autoselectFormat, c
 
   mIntent = settings.getString("Intent");
 
-  mDocumentFormat = settings.getString("DocumentFormat");
+  mDocumentFormat = settings.getString("DocumentFormatExt");
+  if (mDocumentFormat == "")
+    mDocumentFormat = settings.getString("DocumentFormat");
   std::clog << "document format requested: " << mDocumentFormat << "\n";
   if (autoselectFormat)
     mDocumentFormat = HttpServer::MIME_TYPE_PNG;
@@ -247,21 +266,36 @@ ScanJob::Private::init(const ScanSettingsXml& settings, bool autoselectFormat, c
 
   mImagesToTransfer = 1;
   mImagesCompleted = 0;
+  mImagesTransferred = 0;
+
+  mNumCompletedSides = 0;
 
   std::string inputSource = settings.getString("InputSource");
   if (inputSource == "Platen") {
     mScanSource = mpScanner->platenSourceName();
     mImagesToTransfer = 1;
-    mKind = single;
+    mKind = singleSimplex;
   }
   else if (inputSource == "Feeder") {
     mScanSource = mpScanner->adfSourceName();
-    mImagesToTransfer = std::numeric_limits<int>::max();
+    std::string duplex = settings.getString("Duplex");
+    if (duplex == "true")
+      mScanSource = mpScanner->adfDuplexSourceName();  
+    // mImagesToTransfer = std::numeric_limits<int>::max();
     double batchIfPossible = settings.getNumber("BatchIfPossible");
-    if (batchIfPossible == 1.0 && mDocumentFormat == HttpServer::MIME_TYPE_PDF)
-      mKind = adfBatch;
-    else
-      mKind = adfSingle;
+    if (duplex == "false" && batchIfPossible != 1.0) {
+      mKind = singleSimplex;
+      mImagesToTransfer = 1;
+    } else if (duplex == "true" && batchIfPossible != 1.0) {
+      mKind = singleDuplex;
+      mImagesToTransfer = 2;
+    } else if (duplex == "false" && batchIfPossible == 1.0) {
+      mKind = multiSimplex;
+      mImagesToTransfer = std::numeric_limits<int>::max();
+    } else if (duplex == "true" && batchIfPossible == 1.0) {
+      mKind = multiDuplex;
+      mImagesToTransfer = std::numeric_limits<int>::max();
+    }
   }
   else {
     err = PWG_INVALID_SCAN_TICKET;
@@ -284,12 +318,14 @@ const char*
 ScanJob::Private::kindString() const
 {
   switch (mKind) {
-    case single:
-      return "single";
-    case adfBatch:
-      return "ADF batch";
-    case adfSingle:
-      return "ADF single";
+    case singleSimplex:
+      return "single simplex";
+    case singleDuplex:
+      return "single duplex";
+    case multiSimplex:
+      return "ADF multiple simplex";
+    case multiDuplex:
+      return "ADF multiple duplex";
   }
   return "unknown";
 }
@@ -466,32 +502,74 @@ ScanJob::Private::updateStatus(SANE_Status status)
       break;
     case SANE_STATUS_EOF:
       switch(mKind) {
-      case single:
-          if (mImagesCompleted > 0) {
-              mState = completed;
-              mStateReason = PWG_JOB_COMPLETED_SUCCESSFULLY;
+        case singleSimplex:
+        case multiSimplex:
+          mState = completed;
+          mStateReason = PWG_JOB_COMPLETED_SUCCESSFULLY;
+          break;
+        case singleDuplex:
+        case multiDuplex:
+          if (mNumCompletedSides == 2) {
+            mState = completed;
+            mStateReason = PWG_JOB_COMPLETED_SUCCESSFULLY;  
           } else {
-            mState = pending;
-            mStateReason = PWG_NONE;
+              mState = pending;
+              mStateReason = PWG_NONE;            
           }
-          break;
-      case adfSingle:
-          mState = pending;
-          mStateReason = PWG_NONE;
-          break;
-      case adfBatch:
-          updateStatus(mpSession->start().status());
-          break;
+        // case singleSimplex:
+        //   if (mImagesTransferred == 1) {
+        //       mState = completed;
+        //       mStateReason = PWG_JOB_COMPLETED_SUCCESSFULLY;
+        //   } else {
+        //     mState = pending;
+        //     mStateReason = PWG_NONE;
+        //   }
+        //   break;
+        // case singleDuplex:
+        //   if (mImagesTransferred == 2) {
+        //       mState = completed;
+        //       mStateReason = PWG_JOB_COMPLETED_SUCCESSFULLY;
+        //   } else {
+        //     // Need to continue processing the back side
+        //     mState = pending;
+        //     mStateReason = PWG_NONE;
+        //   }
+        //   break;
+        // case multiSimplex:
+        //   mState = pending;
+        //   mStateReason = PWG_NONE;
+        //   break;
+        // case multiDuplex:
+        //   if (mImagesTransferred % 2 == 1) {
+        //     // Need to continue processing the back side
+        //     mState = pending;
+        //     mStateReason = PWG_NONE;
+        //   } else {
+        //     updateStatus(mpSession->start().status());
+        //     break;
+        //   }
       }
       break;
     case SANE_STATUS_NO_DOCS:
-      if (mImagesCompleted > 0 && (mKind == adfSingle || mKind == adfBatch)) {
-        mState = completed;
-        mStateReason = PWG_JOB_COMPLETED_SUCCESSFULLY;
-      } else {
-        mState = aborted;
-        mStateReason = PWG_RESOURCES_ARE_NOT_READY;
-      }
+      mState = completed;
+      mStateReason = PWG_JOB_COMPLETED_SUCCESSFULLY;    
+      //if (mImagesCompleted > 0 && (mKind == multiSimplex || mKind == multiDuplex)) {
+      // if (mKind == singleSimplex && mImagesTransferred == 1) {
+      //   mState = completed;
+      //   mStateReason = PWG_JOB_COMPLETED_SUCCESSFULLY;
+      //   break;
+      // } else if ((mKind == singleDuplex || mKind == multiDuplex) && mImagesTransferred % 2 == 1) {
+      //   mState = pending;
+      //   mStateReason = PWG_NONE;
+      //   break;
+      // } else if (mKind == multiSimplex || mKind == multiDuplex) {
+      //   mState = completed;
+      //   mStateReason = PWG_JOB_COMPLETED_SUCCESSFULLY;
+      //   break;
+      // } else {
+      //   mState = aborted;
+      //   mStateReason = PWG_RESOURCES_ARE_NOT_READY;
+      // }
       mAdfStatus = status;
       break;
     default:
@@ -550,6 +628,30 @@ ScanJob::Private::beginTransfer()
   return ok;
 }
 
+bool
+ScanJob::resumeTransfer()
+{
+  return p->resumeTransfer();
+}
+
+bool
+ScanJob::Private::resumeTransfer()
+{
+  if(!atomicTransition(pending, processing))
+    return false;
+
+  // openSession();
+
+  SANE_Status status = SANE_STATUS_GOOD;
+  status = mpSession->start().status();
+  updateStatus(status);
+  
+  bool ok = isProcessing();
+  if (!ok)
+    closeSession();
+  return ok;
+}
+
 void
 ScanJob::Private::openSession()
 {
@@ -566,6 +668,7 @@ ScanJob::Private::openSession()
     opt[SANE_NAME_BIT_DEPTH] = mBitDepth;
     opt[SANE_NAME_SCAN_MODE] = mColorMode;
     opt[SANE_NAME_SCAN_SOURCE] = mScanSource;
+    // opt[MORE_SANE_NAME_ALD] = SANE_TRUE;
     bool ok = opt[SANE_NAME_SCAN_RESOLUTION].set_numeric_value(mRes_dpi);
     if (!ok)
       ok = opt[SANE_NAME_SCAN_X_RESOLUTION].set_numeric_value(mRes_dpi) ||
@@ -590,6 +693,8 @@ ScanJob::Private::openSession()
     opt[SANE_NAME_SCAN_TL_Y] = top;
     opt[SANE_NAME_SCAN_BR_X] = right;
     opt[SANE_NAME_SCAN_BR_Y] = bottom;
+    // opt[SANE_NAME_SCAN_BR_Y] = 876.0;
+    // opt[SANE_NAME_PAGE_HEIGHT] = 876.0;
 
     if (!ok)
       status = SANE_STATUS_INVAL;
@@ -619,6 +724,9 @@ void
 ScanJob::Private::finishTransfer(std::ostream& os)
 {
   std::shared_ptr<ImageEncoder> pEncoder;
+  std::vector<std::vector<char>> preBuffer(0);
+  SANE_Status status = SANE_STATUS_GOOD;  
+  bool isPreBuffered = false;
   if (isProcessing()) {
     if (mDocumentFormat == HttpServer::MIME_TYPE_JPEG) {
       auto jpegEncoder = new JpegEncoder;
@@ -652,6 +760,21 @@ ScanJob::Private::finishTransfer(std::ostream& os)
     auto p = mpSession->parameters();
     pEncoder->setWidth(p->pixels_per_line);
     pEncoder->setHeight(p->lines);
+    std::clog << "encoding height (lines): " << p->lines << std::endl;  
+    // TODO: Buffer if p->lines < 0
+    if (p->lines < 0) {
+      preBuffer.reserve(4000);
+      std::vector<char> buffer(mpSession->parameters()->bytes_per_line);
+      while (status == SANE_STATUS_GOOD && os && isProcessing()) {
+        status = mpSession->read(buffer).status();
+        if (status == SANE_STATUS_GOOD) {
+          preBuffer.push_back(buffer);
+        }
+      }
+      std::clog << "pre_buffer size: " << preBuffer.size() << std::endl;
+      pEncoder->setHeight(preBuffer.size());
+      isPreBuffered = true;
+    }
     pEncoder->setBitDepth(p->depth);
     pEncoder->setDestination(&os);
     if (mSynthesizedGray && pEncoder->bytesPerLine() != p->bytes_per_line / 3) {
@@ -672,11 +795,30 @@ ScanJob::Private::finishTransfer(std::ostream& os)
     }
   }
   while (isProcessing()) {
-    std::vector<char> buffer(mpSession->parameters()->bytes_per_line);
-    SANE_Status status = SANE_STATUS_GOOD;
-    while (status == SANE_STATUS_GOOD && os && isProcessing()) {
-      status = mpSession->read(buffer).status();
-      if (status == SANE_STATUS_GOOD) {
+    if (!isPreBuffered) {
+      std::vector<char> buffer(mpSession->parameters()->bytes_per_line);
+      status = SANE_STATUS_GOOD;
+      while (status == SANE_STATUS_GOOD && os && isProcessing()) {
+        status = mpSession->read(buffer).status();
+        if (status == SANE_STATUS_GOOD) {
+          applyGamma(buffer);
+          if (mSynthesizedGray)
+            synthesizeGray(buffer);
+          try {
+            pEncoder->writeLine(buffer.data());
+            if (!os.flush())
+              throw std::runtime_error("Could not send data");
+          } catch (const std::runtime_error& e) {
+            std::cerr << e.what() << ", aborting" << std::endl;
+            mState = aborted;
+            mStateReason = PWG_ERRORS_DETECTED;
+          }
+        }
+      }
+    } else {
+      std::vector<char> buffer(mpSession->parameters()->bytes_per_line);
+      for (auto& it : preBuffer) {
+        buffer = it;
         applyGamma(buffer);
         if (mSynthesizedGray)
           synthesizeGray(buffer);
@@ -705,8 +847,140 @@ ScanJob::Private::finishTransfer(std::ostream& os)
     }
   }
   pEncoder->endDocument();
-  closeSession();
+  ++mImagesTransferred;
+  std::clog << "images transferred: " << mImagesTransferred << std::endl;
+  // // TODO: Add check here to look for backside of duplex scan...
+  // if (mImagesCompleted < mImagesToTransfer) {
+  //   // Store second side in buffer
+  //   backside_buffer = std::vector<std::vector<char>>(pEncoder->height());
+  //   std::vector<char> buffer(mpSession->parameters()->bytes_per_line);
+  //   status = SANE_STATUS_GOOD;
+  //   updateStatus(status);
+  //   while (status == SANE_STATUS_GOOD && isProcessing()) {
+  //     status = mpSession->read(buffer).status();
+  //     if (status == SANE_STATUS_GOOD) {
+  //       backside_buffer.push_back(buffer);
+  //     }
+  //   }
+  //   std::clog << "backside_buffer size: " << backside_buffer.size() << std::endl;
+  // }
+  // if (isProcessing()) {
+  //   ++mImagesCompleted;
+  //   if (mRotateEvenPages)
+  //     pEncoder->setOrientationDegrees(mImagesCompleted % 2 ? 0 : 180);
+  //   std::clog << "images completed: " << mImagesCompleted << std::endl;
+  //   updateStatus(status);
+  //   if (pEncoder->linesLeftInCurrentImage() != pEncoder->height()) {
+  //     std::cerr << "incomplete or excess scan data" << std::endl;
+  //     mState = aborted;
+  //     mStateReason = PWG_ERRORS_DETECTED;
+  //   }
+  // }
+  if (++mNumCompletedSides == 2 || mKind == singleSimplex || mKind == multiSimplex) {
+    closeSession();
+    mState = completed;
+    mStateReason = PWG_JOB_COMPLETED_SUCCESSFULLY;
+  }
+  else {
+    // mNumCompletedSides++;
+    mState = pending;
+    mStateReason = PWG_NONE;
+  }
 }
+
+// ScanJob&
+// ScanJob::transferBackside(std::ostream& os)
+// {
+//   p->transferBackside(os);
+//   return *this;
+// }
+
+// void
+// ScanJob::Private::transferBackside(std::ostream& os)
+// {
+//   std::shared_ptr<ImageEncoder> pEncoder;
+//     if (mDocumentFormat == HttpServer::MIME_TYPE_JPEG) {
+//       auto jpegEncoder = new JpegEncoder;
+//       jpegEncoder->setGamma(1.0);
+//       jpegEncoder->setQualityPercent(90);
+//       pEncoder.reset(jpegEncoder);
+//     } else if (mDocumentFormat == HttpServer::MIME_TYPE_PDF) {
+//       auto pdfEncoder = new PdfEncoder;
+// #if 0 // "Title" does not conform to pdf/raster
+//       pdfEncoder->documentInfo()["Title"] =
+//         mUuid + "/" + sanecpp::dtostr_c(mImagesCompleted);
+// #endif
+//       pdfEncoder->documentInfo()["Creator"] =
+//         mpScanner->makeAndModel() + " (SANE)";
+//       pdfEncoder->documentInfo()["Producer"] = "AirSane Server";
+//       pEncoder.reset(pdfEncoder);
+//     } else if (mDocumentFormat == HttpServer::MIME_TYPE_PNG) {
+//       auto pngEncoder = new PngEncoder;
+//       pEncoder.reset(pngEncoder);
+//     } else {
+//       mState = aborted;
+//       mStateReason = PWG_UNSUPPORTED_DOCUMENT_FORMAT;
+//     }
+//     pEncoder->setResolutionDpi(mRes_dpi);
+//     if (mColorScan)
+//       pEncoder->setColorspace(ImageEncoder::RGB);
+//     else
+//       pEncoder->setColorspace(ImageEncoder::Grayscale);
+//     auto p = mpSession->parameters();
+//     pEncoder->setWidth(p->pixels_per_line);
+//     pEncoder->setHeight(p->lines);
+//     pEncoder->setBitDepth(p->depth);
+//     pEncoder->setDestination(&os);
+//     if (mSynthesizedGray && pEncoder->bytesPerLine() != p->bytes_per_line / 3) {
+//       std::cerr << __FILE__ << ", line " << __LINE__
+//                 << ": encoder bytesPerLine (" << pEncoder->bytesPerLine()
+//                 << ") differs from SANE bytes_per_line/3 ("
+//                 << p->bytes_per_line / 3 << ")" << std::endl;
+//       mState = aborted;
+//       mStateReason = PWG_ERRORS_DETECTED;
+//     } else if (!mSynthesizedGray &&
+//                pEncoder->bytesPerLine() != p->bytes_per_line) {
+//       std::cerr << __FILE__ << ", line " << __LINE__
+//                 << ": encoder bytesPerLine (" << pEncoder->bytesPerLine()
+//                 << ") differs from SANE bytes_per_line (" << p->bytes_per_line
+//                 << ")" << std::endl;
+//       // mState = aborted;
+//       // mStateReason = PWG_ERRORS_DETECTED;
+//       return;
+//     }
+//       std::vector<char> buffer(mpSession->parameters()->bytes_per_line);
+//       for (auto& it : backside_buffer) {
+//         buffer = it;
+//         applyGamma(buffer);
+//         if (mSynthesizedGray)
+//           synthesizeGray(buffer);
+//         try {
+//           pEncoder->writeLine(buffer.data());
+//           if (!os.flush())
+//             throw std::runtime_error("Could not send data");
+//         } catch (const std::runtime_error& e) {
+//           std::cerr << e.what() << ", aborting" << std::endl;
+//           // mState = aborted;
+//           // mStateReason = PWG_ERRORS_DETECTED;
+//         }
+//       }
+//     // if (isProcessing()) {
+//     //   ++mImagesCompleted;
+//     //   if (mRotateEvenPages)
+//     //     pEncoder->setOrientationDegrees(mImagesCompleted % 2 ? 0 : 180);
+//       std::clog << "images completed: " << mImagesCompleted << std::endl;
+//       // updateStatus(status);
+//       if (pEncoder->linesLeftInCurrentImage() != pEncoder->height()) {
+//         std::cerr << "incomplete or excess scan data" << std::endl;
+//         mState = aborted;
+//         mStateReason = PWG_ERRORS_DETECTED;
+//       }
+//     // }
+//   // }
+//   pEncoder->endDocument();
+//   ++mImagesTransferred;
+//   std::clog << "images transferred: " << mImagesTransferred << std::endl;
+// }
 
 ScanJob&
 ScanJob::cancel()
@@ -759,6 +1033,18 @@ ScanJob::isAborted() const
   return p->isAborted();
 }
 
+int
+ScanJob::numCompletedSides() const
+{
+  return p->numCompletedSides();
+}
+
+bool
+ScanJob::isSecondSidePending() const
+{
+  return p->isSecondSidePending();
+}
+
 bool
 ScanJob::Private::isPending() const
 {
@@ -790,4 +1076,16 @@ bool
 ScanJob::Private::isAborted() const
 {
   return mState == aborted;
+}
+
+int
+ScanJob::Private::numCompletedSides() const
+{
+  return mNumCompletedSides;
+}
+
+bool
+ScanJob::Private::isSecondSidePending() const
+{
+  return ((mKind == singleDuplex || mKind == multiDuplex) && mNumCompletedSides == 1);
 }

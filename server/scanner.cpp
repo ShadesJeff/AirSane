@@ -19,6 +19,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "scanner.h"
 
 #include <sane/saneopts.h>
+#include "more_saneopts.h"
 
 #include <algorithm>
 #include <cmath>
@@ -191,15 +192,19 @@ struct Scanner::Private
   {
     Private* p;
     std::string mSourceName;
+    std::string mDuplexSourceName;
     std::vector<std::string> mSupportedIntents;
     double mMinWidth, mMaxWidth, mMinHeight, mMaxHeight, mMaxPhysicalWidth,
       mMaxPhysicalHeight;
     int mMaxBits;
 
+    bool mBottomEdgeDetection;
+
     explicit InputSource(Private* p);
     const char* init(const sanecpp::option_set&);
-    void writeCapabilitiesXml(std::ostream&) const;
-  } * mpPlaten, *mpAdf;
+    void writeCapabilitiesXml(std::ostream&, int) const;
+  } *mpPlaten, *mpAdf;
+
   bool mDuplex;
 
   std::string mGrayScanModeName, mColorScanModeName;
@@ -256,7 +261,7 @@ Scanner::Private::writeScannerCapabilitiesXml(std::ostream& os) const
         "<scan:ScannerCapabilities"
         " xmlns:pwg='http://www.pwg.org/schemas/2010/12/sm'"
         " xmlns:scan='http://schemas.hp.com/imaging/escl/2011/05/03'>\r\n"
-        "<pwg:Version>2.0</pwg:Version>\r\n"
+        "<pwg:Version>2.6</pwg:Version>\r\n"
         "<pwg:MakeAndModel>"
      << xmlEscape(mMakeAndModel)
      << "</pwg:MakeAndModel>\r\n"
@@ -266,14 +271,20 @@ Scanner::Private::writeScannerCapabilitiesXml(std::ostream& os) const
     os << "<scan:AdminURI>" << mAdminUrl << "</scan:AdminURI>\r\n";
   if (!mIconUrl.empty())
     os << "<scan:IconURI>" << mIconUrl << "</scan:IconURI>\r\n";
+
+  // // write settings profile
+  // os << "<scan:SettingProfiles>\r\n";
+  // writeSettingProfile(8, os); // should be mMaxBits
+  // os << "</scan:SettingProfiles>\r\n";
+
   if (mpPlaten) {
     os << "<scan:Platen>\r\n<scan:PlatenInputCaps>\r\n";
-    mpPlaten->writeCapabilitiesXml(os);
+    mpPlaten->writeCapabilitiesXml(os, 1);
     os << "</scan:PlatenInputCaps>\r\n</scan:Platen>\r\n";
   }
   if (mpAdf && !mDuplex) {
     os << "<scan:Adf>\r\n<scan:AdfSimplexInputCaps>\r\n";
-    mpAdf->writeCapabilitiesXml(os);
+    mpAdf->writeCapabilitiesXml(os, 1);
     os << "</scan:AdfSimplexInputCaps>\r\n"
        << "<scan:AdfOptions>\r\n"
        << "<scan:AdfOption>DetectPaperLoaded</scan:AdfOption>\r\n"
@@ -281,13 +292,29 @@ Scanner::Private::writeScannerCapabilitiesXml(std::ostream& os) const
        << "</scan:Adf>\r\n";
   }
   if (mpAdf && mDuplex) {
-    os << "<scan:Adf>\r\n<scan:AdfDuplexInputCaps>\r\n";
-    mpAdf->writeCapabilitiesXml(os);
+
+    os << "<scan:Adf>\r\n<scan:AdfSimplexInputCaps>\r\n";
+    mpAdf->writeCapabilitiesXml(os, 1);
+    os << "</scan:AdfSimplexInputCaps>\r\n";
+       //<< "<scan:AdfOptions>\r\n"
+       //<< "<scan:AdfOption>DetectPaperLoaded</scan:AdfOption>\r\n"
+       //<< "</scan:AdfOptions>\r\n";
+       //<< "</scan:Adf>\r\n";
+    
+    //os << "<scan:Adf>\r\n<scan:AdfDuplexInputCaps>\r\n";
+    os << "<scan:AdfDuplexInputCaps>\r\n";
+    mpAdf->writeCapabilitiesXml(os, 2);
     os << "</scan:AdfDuplexInputCaps>\r\n"
-       << "<scan:AdfOptions>\r\n"
-       << "<scan:AdfOption>DetectPaperLoaded</scan:AdfOption>\r\n"
-       << "</scan:AdfOptions>\r\n"
-       << "</scan:Adf>\r\n";
+       << "<scan:AdfOptions>\r\n";
+    if (mDuplex)
+       os << "<scan:AdfOption>Duplex</scan:AdfOption>\r\n";
+    os << "<scan:AdfOption>DetectPaperLoaded</scan:AdfOption>\r\n"
+       << "<scan:AdfOption>SelectSinglePage</scan:AdfOption>\r\n"
+       << "</scan:AdfOptions>\r\n";
+
+    os << "<scan:FeederCapacity>50</scan:FeederCapacity>\r\n";    
+    
+    os << "</scan:Adf>\r\n";
   }
   os << "</scan:ScannerCapabilities>\r\n";
 }
@@ -295,7 +322,7 @@ Scanner::Private::writeScannerCapabilitiesXml(std::ostream& os) const
 void
 Scanner::Private::writeSettingProfile(int bits, std::ostream& os) const
 {
-  os << "<scan:SettingProfile name='" << mCurrentProfile++
+  os << "<scan:SettingProfile name='p" << mCurrentProfile++
      << "'>\r\n"
         "<scan:ColorModes>\r\n";
   for (const auto& cs : mTxtColorSpaces)
@@ -349,6 +376,8 @@ Scanner::Private::writeSettingProfile(int bits, std::ostream& os) const
         "<scan:DocumentFormats>\r\n";
   for (const auto& format : mDocumentFormats)
     os << "<pwg:DocumentFormat>" << format << "</pwg:DocumentFormat>\r\n";
+  for (const auto& format : mDocumentFormats)
+    os << "<scan:DocumentFormatExt>" << format << "</scan:DocumentFormatExt>\r\n";    
   os << "</scan:DocumentFormats>\r\n"
         "</scan:SettingProfile>\r\n";
 }
@@ -401,7 +430,7 @@ Scanner::Private::InputSource::InputSource(Private* p)
 {}
 
 void
-Scanner::Private::InputSource::writeCapabilitiesXml(std::ostream& os) const
+Scanner::Private::InputSource::writeCapabilitiesXml(std::ostream& os, int maxScanRegions) const
 {
   os << "<scan:MinWidth>" << mMinWidth
      << "</scan:MinWidth>\r\n"
@@ -420,14 +449,26 @@ Scanner::Private::InputSource::writeCapabilitiesXml(std::ostream& os) const
         "<scan:MaxPhysicalHeight>"
      << mMaxPhysicalHeight
      << "</scan:MaxPhysicalHeight>\r\n"
-        "<scan:MaxScanRegions>1</scan:MaxScanRegions>\r\n"
-        "<scan:SettingProfiles>\r\n";
+        "<scan:MaxScanRegions>"<< maxScanRegions << "</scan:MaxScanRegions>\r\n";
+
+  os << "<scan:SettingProfiles>\r\n";
   p->writeSettingProfile(mMaxBits, os);
-  os << "</scan:SettingProfiles>\r\n"
-        "<scan:SupportedIntents>\r\n";
-  for (const auto& s : mSupportedIntents)
-    os << "<scan:SupportedIntent>" << s << "</scan:SupportedIntent>\r\n";
-  os << "</scan:SupportedIntents>\r\n";
+  os << "</scan:SettingProfiles>\r\n";
+
+  // write setting profile reference
+  // os << "<scan:SettingProfiles>\r\n"
+  //    << "<scan:SettingProfile ref=\"p0\"/>"
+  //    << "</scan:SettingProfiles>\r\n";
+
+  if (mBottomEdgeDetection)
+    os  << "<scan:EdgeAutoDetection>\r\n"
+        << "<scan:SupportedEdge>BottomEdge</scan:SupportedEdge>\r\n"
+        << "</scan:EdgeAutoDetection>\r\n";
+
+  // os << "<scan:SupportedIntents>\r\n";
+  // for (const auto& s : mSupportedIntents)
+  //   os << "<scan:SupportedIntent>" << s << "</scan:SupportedIntent>\r\n";
+  // os << "</scan:SupportedIntents>\r\n";
 }
 
 void
@@ -489,6 +530,7 @@ Scanner::Private::init(const sanecpp::device_info& info, bool randomUuid)
     HttpServer::MIME_TYPE_PDF,
     HttpServer::MIME_TYPE_JPEG,
     HttpServer::MIME_TYPE_PNG,
+    // "application/octet-stream",
   });
 
   auto modes = opt[SANE_NAME_SCAN_MODE].allowed_string_values();
@@ -546,7 +588,7 @@ Scanner::Private::init(const sanecpp::device_info& info, bool randomUuid)
   if (!adfName.empty()) {
     mInputSources.push_back("Feeder");
     mDuplex = !adfDuplexName.empty();
-    opt[SANE_NAME_SCAN_SOURCE].set_string_value(adfName);
+    opt[SANE_NAME_SCAN_SOURCE].set_string_value(adfSimplexName);
     mpAdf = new Private::InputSource(this);
     err = mpAdf->init(opt);
     if (!err) {
@@ -554,6 +596,8 @@ Scanner::Private::init(const sanecpp::device_info& info, bool randomUuid)
         "TextAndGraphic",
         "Photo",
       });
+      if (mDuplex)
+        mpAdf->mDuplexSourceName = adfDuplexName;
       maxBits = std::max(maxBits, mpAdf->mMaxBits);
       mMaxWidthPx300dpi = std::max(mMaxWidthPx300dpi, mpAdf->mMaxWidth);
       mMaxHeightPx300dpi = std::max(mMaxHeightPx300dpi, mpAdf->mMaxHeight);
@@ -578,6 +622,11 @@ Scanner::Private::InputSource::init(const sanecpp::option_set& opt)
   mMaxBits = 8;
   if (!opt[SANE_NAME_BIT_DEPTH].is_null())
     mMaxBits = opt[SANE_NAME_BIT_DEPTH].max();
+
+  // lower edge detection
+  mBottomEdgeDetection = true;
+  if (!opt[MORE_SANE_NAME_ALD].is_null())
+    mBottomEdgeDetection = opt[MORE_SANE_NAME_ALD].is_active();
 
   const auto &tl_x = opt[SANE_NAME_SCAN_TL_X], &tl_y = opt[SANE_NAME_SCAN_TL_Y],
              &br_x = opt[SANE_NAME_SCAN_BR_X], &br_y = opt[SANE_NAME_SCAN_BR_Y];
@@ -806,6 +855,12 @@ Scanner::adfSourceName() const
 }
 
 std::string
+Scanner::adfDuplexSourceName() const
+{
+  return (p->mpAdf && p->mDuplex) ? p->mpAdf->mDuplexSourceName : "";
+}
+
+std::string
 Scanner::grayScanModeName() const
 {
   return p->mGrayScanModeName;
@@ -914,7 +969,7 @@ Scanner::writeScannerStatusXml(std::ostream& os) const
   os << "<?xml version='1.0' encoding='UTF-8'?>\r\n"
         "<scan:ScannerStatus xmlns:pwg='http://www.pwg.org/schemas/2010/12/sm'"
         " xmlns:scan='http://schemas.hp.com/imaging/escl/2011/05/03'>\r\n"
-        "<pwg:Version>2.0</pwg:Version>\r\n"
+        "<pwg:Version>2.6</pwg:Version>\r\n"
         "<pwg:State>"
      << p->statusString()
      << "</pwg:State>\r\n"

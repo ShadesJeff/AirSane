@@ -72,6 +72,7 @@ public:
 
   std::string platenSourceName() const;
   std::string adfSourceName() const;
+  std::string adfDuplexSourceName() const;
   std::string grayScanModeName() const;
   std::string colorScanModeName() const;
 
@@ -89,6 +90,8 @@ public:
   bool isOpen() const;
 
   void setDeviceOptions(const OptionsFile&);
+
+  //void writeSettingProfile(int, std::ostream&) const;
 
   void writeScannerCapabilitiesXml(std::ostream&) const;
   void writeScannerStatusXml(std::ostream&) const;
