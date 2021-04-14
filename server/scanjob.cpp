@@ -660,10 +660,9 @@ ScanJob::Private::openSession()
     opt[SANE_NAME_SCAN_BR_X] = right;
     opt[SANE_NAME_SCAN_BR_Y] = bottom;
     
-    // TODO: Read maximum length from sane rather than hardcoding...
     if (mUseEdgeDetection) {
-      opt[SANE_NAME_SCAN_BR_Y] = 876.0;
-      opt[SANE_NAME_PAGE_HEIGHT] = 876.0;
+      opt[SANE_NAME_SCAN_BR_Y] = opt[SANE_NAME_SCAN_BR_Y].max();
+      opt[SANE_NAME_PAGE_HEIGHT] = opt[SANE_NAME_PAGE_HEIGHT].max();
     }
 
     if (!ok)
