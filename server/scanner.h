@@ -34,8 +34,10 @@ class Scanner
   Scanner& operator=(const Scanner&) = delete;
 
 public:
-  explicit Scanner(const sanecpp::device_info&, bool randomUuid = false);
+  explicit Scanner(const sanecpp::device_info&);
   ~Scanner();
+  bool initWithOptions(const OptionsFile&);
+
 
   const char* error() const;
   std::string statusString() const;
@@ -48,11 +50,14 @@ public:
   void setPublishedName(const std::string&);
   const std::string& publishedName() const;
 
+  void setUri(const std::string&);
+  const std::string& uri() const;
   void setAdminUrl(const std::string&);
   const std::string& adminUrl() const;
   void setIconUrl(const std::string&);
   const std::string& iconUrl() const;
   const std::string& iconFile() const;
+  const std::string& note() const;
 
   const std::vector<std::string>& documentFormats() const;
   const std::vector<std::string>& txtColorSpaces() const;

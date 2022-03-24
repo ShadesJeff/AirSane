@@ -17,7 +17,8 @@ Apple's Image Capture, but a simple web interface is provided as well.
 Images are encoded on-the-fly during acquisition, keeping memory/storage
 demands low. Thus, AirSane will run fine on a Raspberry Pi or similar device.
 
-Authentication and secure communication are not supported.
+Authentication and secure communication are supported in conjunction with a
+proxy server such as nginx (see the [https readme file](README.https.md)).
 
 If you are looking for a powerful SANE web frontend, AirSane may not be for you.
 You may be interested in [phpSANE](https://sourceforge.net/projects/phpsane) instead.
@@ -28,6 +29,9 @@ implemented in Apple's AirScanScanner client
 
 Regarding the mdns announcement, and the basic working of the eSCL protocol,
 [David Poole's blog](http://testcluster.blogspot.com/2014/03) was very helpful.
+
+In the meantime, the eSCL protocol has been officially published
+[here](https://mopria.org/mopria-escl-specification).
 
 ## Usage
 ### Web interface
@@ -45,6 +49,15 @@ If you define a custom icon for your scanner (see below), note that you will
 have to use the scanner through 'Image Capture' once before it will be
 shown with this icon in 'Printers and Scanners'. This seems to be a bug in macOS
 at least up to Catalina.
+
+### Windows 11
+Go to "Settings"->"Bluetooth & devices"->"Printers and Scanners."
+There, click "Add Device".
+AirSane devices will appear as devices to add, click "Add".
+Wait until the device appears in the list of devices below, click the device,
+and choose "Install app" or "Open scanner" in order to install the Microsoft
+scanner app, or open it if has been installed before.
+Note that Windows 11 does not allow more than 4 scanners per AirSane instance.
 
 ### Mopria client on Android
 As of version 1.4.10, the Mopria Scan App will detect all AirSane scanners and
@@ -102,7 +115,7 @@ of them.
 To install AirSane:
 ```
 sudo apt-get install avahi-daemon
-sudo make install
+make && sudo make install
 sudo systemctl enable airsaned
 sudo systemctl start airsaned
 sudo systemctl status airsaned
@@ -120,7 +133,7 @@ by editing '/etc/default/airsane'. For options, and their meanings, run
 ```
 airsaned --help
 ```
-By default, the server listens on all local addresses, and on a range of ports beginning 8090.
+By default, the server listens on all local addresses, and on a range of ports beginning at 8090.
 From there, each exported scanner has its own port (this is necessary to match the mdns-sd
 specification which allows only a single service to be announced per address/port combination).
 
@@ -170,6 +183,10 @@ location of the options file.
 
 The image should have a size of 512x512, 256x256 or 128x128 pixels and an alpha channel for transparency.
 If pixel dimensions are not powers of two, the image will not be accepted by macOS.
+#### location
+A string that appears in the `note` field of the mDNS announcement. This should be an indication where the scanner is located,
+such as "Living Room" or "Office." If no location is given in the options file, this defaults to the host name of the machine
+that runs airsaned.
 
 ### Example
 ```
@@ -190,6 +207,7 @@ synthesize-gray yes
 # Set icon and calibration file option for a scanner "Canon LiDE 60"
 device Canon LiDE 60
 icon CanonLiDE60.png
+location Living Room
 calibration-file /home/simul/some path with spaces/canon-lide-60.cal
 ```
 
@@ -228,13 +246,6 @@ You have libpng installed in an old version. Some distributions provide libpng12
 Installing libpng16-dev should fix the issue:
 ```
    sudo apt install libpng16-dev
-```
-* Compiling fails because of **`#include <libpng/png.h>`** not being found. 
-On some distributions (e.g., Arch Linux), `libpng` may come in multiple flavors, with each having its
-own `/usr/include` subdirectory. 
-Creating a symlink will then fix the build:
-```
-  sudo ln -s /usr/include/libpng16/ /usr/include/libpng/
 ```
 * If you are able to open the server's web page locally, but **not from a remote
 machine,** you may have to allow access to port 8090 in your iptables
