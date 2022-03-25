@@ -16,17 +16,18 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "mainserver.h"
+#include "server.h"
 #include "web/webpage.h"
 
 class MainPage : public WebPage
 {
 public:
-  explicit MainPage(const ScannerList&);
+  explicit MainPage(const ScannerList&, bool resetoption, bool discloseversion);
 
 protected:
   void onRender() override;
 
 private:
   const ScannerList& mScanners;
+  bool mResetoption, mDiscloseversion;
 };

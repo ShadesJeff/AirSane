@@ -22,10 +22,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "imageformats/pngencoder.h"
 #include "scanner.h"
 #include "web/httpserver.h"
+
 #include <atomic>
 #include <cassert>
 #include <cmath>
 #include <regex>
+#include <stdexcept>
+#include <limits>
+
 #include <sane/saneopts.h>
 #include "more_saneopts.h"
 
@@ -85,7 +89,7 @@ struct ScanJob::Private
   void init(const ScanSettingsXml&, bool autoselectFormat, const OptionsFile::Options&);
   const char* kindString() const;
   void applyDeviceOptions(const OptionsFile::Options&);
-  void initGammaTable(const std::string& gamma);
+  void initGammaTable(float gamma);
   void applyGamma(std::vector<char>&);
   void synthesizeGray(std::vector<char>&);
   const char* statusString() const;
@@ -182,7 +186,7 @@ ScanJob::imagesTransferred() const
 std::string
 ScanJob::uri() const
 {
-  return "/eSCL/ScanJobs/" + p->mUuid;
+  return p->mpScanner->uri() + "/ScanJobs/" + p->mUuid;
 }
 
 const std::string&
@@ -291,10 +295,10 @@ ScanJob::Private::init(const ScanSettingsXml& settings, bool autoselectFormat, c
 
     std::string duplex = settings.getString("Duplex");
     if (duplex == "true")
-      mScanSource = mpScanner->adfDuplexSourceName();  
+      mScanSource = mpScanner->adfDuplexSourceName();
 
     double batchIfPossible = settings.getNumber("BatchIfPossible");
-    
+
     if (duplex == "false" && batchIfPossible != 1.0) {
       mKind = singleSimplex;
       mImagesToTransfer = 1;
@@ -345,54 +349,34 @@ ScanJob::Private::kindString() const
 void
 ScanJob::Private::applyDeviceOptions(const OptionsFile::Options& options)
 {
-  mDeviceOptions.clear();
+  mDeviceOptions = options;
   mGammaTable.clear();
-  mSynthesizedGray = false;
-  mRotateEvenPages = false;
-  for (const auto& option : options) {
-    if (option.first == "gray-gamma") {
-      if (!mColorScan) {
-        std::clog << "using grayscale gamma of " << option.second << std::endl;
-        initGammaTable(option.second);
-      }
-    } else if (option.first == "color-gamma") {
-      if (mColorScan) {
-        std::clog << "using color gamma of " << option.second << std::endl;
-        initGammaTable(option.second);
-      }
-    } else if (option.first == "synthesize-gray") {
-      if (!mColorScan) {
-        if (option.second == "yes") {
-          std::clog << "synthesizing grayscale from RGB" << std::endl;
-          mSynthesizedGray = true;
-          mColorMode = mpScanner->colorScanModeName();
-        } else {
-          std::clog << "requesting grayscale from backend" << std::endl;
-          mSynthesizedGray = false;
-          mColorMode = mpScanner->grayScanModeName();
-        }
-      }
-#if 0
-    } else if (option.first == "rotate-even") {
-        if (option.second == "yes") {
-            std::clog << "rotating even-numbered pages by 180 degrees" << std::endl;
-            mRotateEvenPages = true;
-        } else {
-            std::clog << "not rotating pages" << std::endl;
-            mRotateEvenPages = false;
-        }
-#endif
-    } else {
-      mDeviceOptions.push_back(option);
+  if (!mColorScan) {
+    std::clog << "using grayscale gamma of " << options.gray_gamma << std::endl;
+    initGammaTable(options.gray_gamma);
+  }
+  else {
+    std::clog << "using color gamma of " << options.color_gamma << std::endl;
+    initGammaTable(options.color_gamma);
+  }
+  if (!mColorScan) {
+    if (options.synthesize_gray) {
+      std::clog << "synthesizing grayscale from RGB" << std::endl;
+      mColorMode = mpScanner->colorScanModeName();
+    }
+    else {
+      std::clog << "requesting grayscale from backend" << std::endl;
+      mColorMode = mpScanner->grayScanModeName();
     }
   }
 }
 
 void
-ScanJob::Private::initGammaTable(const std::string& gamma)
+ScanJob::Private::initGammaTable(float gammaVal)
 {
-  float gammaVal = ::atof(gamma.c_str());
   mGammaTable.clear();
+  if (gammaVal == 1.0f)
+    return;
   int size = 1L << mBitDepth;
   float scale = 1.0f / (size - 1), invscale = size - 1;
   mGammaTable.resize(size);
@@ -523,16 +507,16 @@ ScanJob::Private::updateStatus(SANE_Status status)
         case multiDuplex:
           if (mNumCompletedSides == 2) {
             mState = completed;
-            mStateReason = PWG_JOB_COMPLETED_SUCCESSFULLY;  
+            mStateReason = PWG_JOB_COMPLETED_SUCCESSFULLY;
           } else {
               mState = pending;
-              mStateReason = PWG_NONE;            
+              mStateReason = PWG_NONE;
           }
       }
       break;
     case SANE_STATUS_NO_DOCS:
       mState = completed;
-      mStateReason = PWG_JOB_COMPLETED_SUCCESSFULLY;    
+      mStateReason = PWG_JOB_COMPLETED_SUCCESSFULLY;
       mAdfStatus = status;
       break;
     default:
@@ -608,7 +592,7 @@ ScanJob::Private::resumeTransfer()
   SANE_Status status = SANE_STATUS_GOOD;
   status = mpSession->start().status();
   updateStatus(status);
-  
+
   bool ok = isProcessing();
   if (!ok)
     closeSession();
@@ -626,6 +610,9 @@ ScanJob::Private::openSession()
 
     auto& opt = mpSession->options();
 
+    for (const auto& option : mDeviceOptions.sane_options)
+      opt[option.first] = option.second;
+
     if (mIntent == "Preview")
       opt[SANE_NAME_PREVIEW] = 1;
     opt[SANE_NAME_BIT_DEPTH] = mBitDepth;
@@ -634,7 +621,7 @@ ScanJob::Private::openSession()
 
     if (mUseEdgeDetection)
       opt[MORE_SANE_NAME_ALD] = SANE_TRUE;
-    
+
     bool ok = opt[SANE_NAME_SCAN_RESOLUTION].set_numeric_value(mRes_dpi);
     if (!ok)
       ok = opt[SANE_NAME_SCAN_X_RESOLUTION].set_numeric_value(mRes_dpi) ||
@@ -659,7 +646,7 @@ ScanJob::Private::openSession()
     opt[SANE_NAME_SCAN_TL_Y] = top;
     opt[SANE_NAME_SCAN_BR_X] = right;
     opt[SANE_NAME_SCAN_BR_Y] = bottom;
-    
+
     if (mUseEdgeDetection) {
       opt[SANE_NAME_SCAN_BR_Y] = opt[SANE_NAME_SCAN_BR_Y].max();
       opt[SANE_NAME_PAGE_HEIGHT] = opt[SANE_NAME_PAGE_HEIGHT].max();
@@ -694,7 +681,7 @@ ScanJob::Private::finishTransfer(std::ostream& os)
 {
   std::shared_ptr<ImageEncoder> pEncoder;
   std::vector<std::vector<char>> vvcPreBuffer(0);
-  SANE_Status status = SANE_STATUS_GOOD;  
+  SANE_Status status = SANE_STATUS_GOOD;
   bool isPreBuffered = false;
   if (isProcessing()) {
     if (mDocumentFormat == HttpServer::MIME_TYPE_JPEG) {
@@ -729,7 +716,7 @@ ScanJob::Private::finishTransfer(std::ostream& os)
     auto p = mpSession->parameters();
     pEncoder->setWidth(p->pixels_per_line);
     pEncoder->setHeight(p->lines);
-    std::clog << "encoding height (lines): " << p->lines << std::endl;  
+    std::clog << "encoding height (lines): " << p->lines << std::endl;
     // Buffer if p->lines < 0
     if (p->lines < 0) {
       vvcPreBuffer.reserve(4000);
@@ -746,14 +733,14 @@ ScanJob::Private::finishTransfer(std::ostream& os)
     }
     pEncoder->setBitDepth(p->depth);
     pEncoder->setDestination(&os);
-    if (mSynthesizedGray && pEncoder->bytesPerLine() != p->bytes_per_line / 3) {
+    if (mDeviceOptions.synthesize_gray && pEncoder->bytesPerLine() != p->bytes_per_line / 3) {
       std::cerr << __FILE__ << ", line " << __LINE__
                 << ": encoder bytesPerLine (" << pEncoder->bytesPerLine()
                 << ") differs from SANE bytes_per_line/3 ("
                 << p->bytes_per_line / 3 << ")" << std::endl;
       mState = aborted;
       mStateReason = PWG_ERRORS_DETECTED;
-    } else if (!mSynthesizedGray &&
+    } else if (!mDeviceOptions.synthesize_gray &&
                pEncoder->bytesPerLine() != p->bytes_per_line) {
       std::cerr << __FILE__ << ", line " << __LINE__
                 << ": encoder bytesPerLine (" << pEncoder->bytesPerLine()
@@ -790,7 +777,7 @@ ScanJob::Private::finishTransfer(std::ostream& os)
       for (auto& it : vvcPreBuffer) {
         buffer = it;
         applyGamma(buffer);
-        if (mSynthesizedGray)
+        if (mDeviceOptions.synthesize_gray)
           synthesizeGray(buffer);
         try {
           pEncoder->writeLine(buffer.data());
@@ -805,8 +792,6 @@ ScanJob::Private::finishTransfer(std::ostream& os)
     }
     if (isProcessing()) {
       ++mImagesCompleted;
-      if (mRotateEvenPages)
-        pEncoder->setOrientationDegrees(mImagesCompleted % 2 ? 0 : 180);
       std::clog << "images completed: " << mImagesCompleted << std::endl;
       updateStatus(status);
       if (pEncoder->linesLeftInCurrentImage() != pEncoder->height()) {
